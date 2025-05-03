@@ -33,11 +33,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# MT5 connection parameters
-MT5_ACCOUNT = 79697927
-MT5_PASSWORD = "Tufail@12345"
-MT5_SERVER = "Exness-MT5Trial8"
-
+ 
 # Connect to MetaTrader 5
 def connect_mt5():
     # First check if MT5 is already initialized and shut it down if needed
