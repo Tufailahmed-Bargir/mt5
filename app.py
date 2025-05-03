@@ -40,19 +40,36 @@ MT5_SERVER = "Exness-MT5Trial8"
 
 # Connect to MetaTrader 5
 def connect_mt5():
-    if not mt5.initialize():
+    # First check if MT5 is already initialized and shut it down if needed
+    if mt5.initialize():
+        mt5.shutdown()
+    
+    # Initialize with timeout parameter
+    if not mt5.initialize(timeout=60000):  # 60 seconds timeout
         error_code, error_message = mt5.last_error()
         print(f"MT5 Initialization failed: ({error_code}, {error_message})")
         raise HTTPException(status_code=500, detail=f"Failed to initialize MT5: ({error_code}, {error_message})")
 
-    authorized = mt5.login(MT5_ACCOUNT, password=MT5_PASSWORD, server=MT5_SERVER)
-    if not authorized:
-        error_code, error_message = mt5.last_error()
-        print(f"MT5 Login failed: ({error_code}, {error_message})")
-        raise HTTPException(status_code=401, detail=f"Failed to login to MT5: ({error_code}, {error_message})")
-
-    print("MT5 Login successful")
-    return True
+    # Convert login to integer and use explicit parameter names
+    try:
+        # Using global variables here
+        account = int(MT5_ACCOUNT)
+        authorized = mt5.login(
+            login=account,
+            password=MT5_PASSWORD,
+            server=MT5_SERVER,
+            timeout=60000
+        )
+        
+        if not authorized:
+            error_code, error_message = mt5.last_error()
+            print(f"MT5 Login failed: ({error_code}, {error_message})")
+            raise HTTPException(status_code=401, detail=f"Failed to login to MT5: ({error_code}, {error_message})")
+    
+        print("MT5 Login successful")
+        return True
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid login format - must be an integer")
 
 # Function to create JWT token
 def create_jwt_token(data: dict, expires_delta: timedelta = None):
