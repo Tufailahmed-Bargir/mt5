@@ -1,5 +1,5 @@
 import MetaTrader5 as mt5
-from fastapi import FastAPI, HTTPException, Query, Form, Body, Depends
+from fastapi import FastAPI, HTTPException, Query, Form, Body, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 import uvicorn
@@ -9,9 +9,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import jwt
 import os
- 
-
- 
+from uuid import uuid4
 
 # JWT Configuration
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-should-be-very-long-and-secure")
@@ -33,39 +31,63 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
- 
-# Connect to MetaTrader 5
-def connect_mt5():
-    # First check if MT5 is already initialized and shut it down if needed
-    if mt5.initialize():
-        mt5.shutdown()
-    
-    # Initialize with timeout parameter
-    if not mt5.initialize(timeout=60000):  # 60 seconds timeout
+# User session management - store user MT5 credentials in memory
+# In a production environment, you'd use a more robust storage like Redis
+user_sessions = {}
+
+# Competition models
+class Competition(BaseModel):
+    name: str
+    description: str
+    start_date: datetime
+    end_date: datetime
+    prize_details: str
+    status: str = "upcoming"  # upcoming, active, completed
+
+class CompetitionRegistration(BaseModel):
+    user_id: str
+    name: str
+    email: str
+    experience: str
+    comments: Optional[str] = None
+
+class CompetitionParticipant(BaseModel):
+    user_id: str
+    user_name: str
+    mt5_account_id: str
+    competition_id: str
+    initial_balance: float = 10000.0
+    registration_date: datetime = None
+
+# In-memory storage for competitions and participants
+# In production, you would use a database
+competitions = {}
+competition_participants = {}
+competition_results = {}
+
+# Connect to MetaTrader 5 with user credentials
+def connect_mt5(login, password, server):
+    # Initialize if not already
+    if not mt5.initialize():
         error_code, error_message = mt5.last_error()
         print(f"MT5 Initialization failed: ({error_code}, {error_message})")
         raise HTTPException(status_code=500, detail=f"Failed to initialize MT5: ({error_code}, {error_message})")
 
-    # Convert login to integer and use explicit parameter names
+    # Convert login to integer
     try:
-        # Using global variables here
-        account = int(MT5_ACCOUNT)
-        authorized = mt5.login(
-            login=account,
-            password=MT5_PASSWORD,
-            server=MT5_SERVER,
-            timeout=60000
-        )
-        
-        if not authorized:
-            error_code, error_message = mt5.last_error()
-            print(f"MT5 Login failed: ({error_code}, {error_message})")
-            raise HTTPException(status_code=401, detail=f"Failed to login to MT5: ({error_code}, {error_message})")
-    
-        print("MT5 Login successful")
-        return True
+        login_int = int(login)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid login format - must be an integer")
+        raise HTTPException(status_code=400, detail="Login ID must be a number")
+
+    # Log in with provided credentials
+    authorized = mt5.login(login_int, password=password, server=server)
+    if not authorized:
+        error_code, error_message = mt5.last_error()
+        print(f"MT5 Login failed: ({error_code}, {error_message})")
+        raise HTTPException(status_code=401, detail=f"Failed to login to MT5: ({error_code}, {error_message})")
+
+    print(f"MT5 Login successful for account {login}")
+    return True
 
 # Function to create JWT token
 def create_jwt_token(data: dict, expires_delta: timedelta = None):
@@ -78,18 +100,21 @@ def create_jwt_token(data: dict, expires_delta: timedelta = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# Function to verify JWT token
-async def verify_token(token: str = Depends(oauth2_scheme)):
+# Function to verify JWT token and get user session
+async def get_user_session(token: str = Depends(oauth2_scheme)):
     if token is None:
-        return None
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        login = payload.get("sub")
-        if login is None:
-            return None
-        return payload
+        session_id = payload.get("session_id")
+        
+        if session_id is None or session_id not in user_sessions:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        return user_sessions[session_id]
     except jwt.PyJWTError:
-        return None
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # Routes
 @app.get("/")
@@ -98,14 +123,14 @@ def root():
     return {"status": "ok", "message": "MT5 API is running"}
 
 @app.get("/api/mt5/account-info")
-def get_account_info():
-    """Get MT5 account information"""
-    connect_mt5()
+async def get_account_info(user: dict = Depends(get_user_session)):
+    """Get MT5 account information for the authenticated user"""
+    connect_mt5(user["login"], user["password"], user["server"])
     account_info = mt5.account_info()
-    
+
     if not account_info:
         raise HTTPException(status_code=500, detail="Failed to get account info")
-    
+
     # Convert to dict
     info = account_info._asdict()
     return {
@@ -122,9 +147,9 @@ def get_account_info():
     }
 
 @app.get("/api/mt5/positions")
-def get_positions():
-    """Get current open positions"""
-    connect_mt5()
+async def get_positions(user: dict = Depends(get_user_session)):
+    """Get current open positions for the authenticated user"""
+    connect_mt5(user["login"], user["password"], user["server"])
     positions = mt5.positions_get()
 
     if positions is None:
@@ -133,7 +158,7 @@ def get_positions():
 
     if len(positions) == 0:
         print("No open positions found.")
-        return {"message": "No open positions found."}
+        return []
 
     positions_data = []
     for position in positions:
@@ -155,23 +180,23 @@ def get_positions():
     return positions_data
 
 @app.get("/api/mt5/history-deals")
-def get_history_deals(days: int = Query(30, ge=1, le=90)):
+async def get_history_deals(days: int = Query(30, ge=1, le=90), user: dict = Depends(get_user_session)):
     """Get historical deals for a specified number of days"""
-    connect_mt5()
-    
+    connect_mt5(user["login"], user["password"], user["server"])
+
     from_date = datetime.now() - timedelta(days=days)
     to_date = datetime.now()
-    
+
     # Convert datetime to timestamp
     from_timestamp = int(from_date.timestamp())
     to_timestamp = int(to_date.timestamp())
-    
+
     # Get history deals
     history_deals = mt5.history_deals_get(from_timestamp, to_timestamp)
-    
+
     if history_deals is None:
         return []
-    
+
     deals_data = []
     for deal in history_deals:
         deal_dict = deal._asdict()
@@ -194,27 +219,27 @@ def get_history_deals(days: int = Query(30, ge=1, le=90)):
             "comment": deal_dict.get("comment"),
             "external_id": deal_dict.get("external_id")
         })
-    
+
     return deals_data
 
 @app.get("/api/mt5/history-orders")
-def get_history_orders(days: int = Query(30, ge=1, le=90)):
+async def get_history_orders(days: int = Query(30, ge=1, le=90), user: dict = Depends(get_user_session)):
     """Get historical orders for a specified number of days"""
-    connect_mt5()
-    
+    connect_mt5(user["login"], user["password"], user["server"])
+
     from_date = datetime.now() - timedelta(days=days)
     to_date = datetime.now()
-    
+
     # Convert datetime to timestamp
     from_timestamp = int(from_date.timestamp())
     to_timestamp = int(to_date.timestamp())
-    
+
     # Get history orders
     history_orders = mt5.history_orders_get(from_timestamp, to_timestamp)
-    
+
     if history_orders is None:
         return []
-    
+
     orders_data = []
     for order in history_orders:
         order_dict = order._asdict()
@@ -239,18 +264,18 @@ def get_history_orders(days: int = Query(30, ge=1, le=90)):
             "comment": order_dict.get("comment"),
             "external_id": order_dict.get("external_id")
         })
-    
+
     return orders_data
 
 @app.get("/api/mt5/symbols")
-def get_symbols():
+async def get_symbols(user: dict = Depends(get_user_session)):
     """Get available symbols"""
-    connect_mt5()
+    connect_mt5(user["login"], user["password"], user["server"])
     symbols = mt5.symbols_get()
-    
+
     if symbols is None:
         return []
-    
+
     symbols_data = []
     for s in symbols:
         if not hasattr(s, 'visible') or s.visible:  # Only return visible symbols
@@ -265,13 +290,13 @@ def get_symbols():
                 "visible": sym_dict.get("visible", True),
                 "path": sym_dict.get("path")
             })
-    
+
     return symbols_data
 
 @app.get("/api/mt5/ticks")
-def get_ticks(symbols: str):
+async def get_ticks(symbols: str, user: dict = Depends(get_user_session)):
     """Get current ticks for multiple symbols"""
-    connect_mt5()
+    connect_mt5(user["login"], user["password"], user["server"])
 
     symbols_list = symbols.split(",")
     ticks_data = {}
@@ -299,9 +324,9 @@ def get_ticks(symbols: str):
     return ticks_data
 
 @app.get("/api/mt5/rates")
-def get_rates(symbol: str, timeframe: str, bars: int = Query(100, ge=10, le=500)):
+async def get_rates(symbol: str, timeframe: str, bars: int = Query(100, ge=10, le=500), user: dict = Depends(get_user_session)):
     """Get historical rates for a symbol and timeframe"""
-    connect_mt5()
+    connect_mt5(user["login"], user["password"], user["server"])
 
     # Map timeframe string to MT5 timeframe constant
     tf_map = {
@@ -348,21 +373,29 @@ class LoginRequest(BaseModel):
 
 @app.post("/api/login")
 def login(request: LoginRequest):
-    global MT5_ACCOUNT, MT5_PASSWORD, MT5_SERVER
-    # Convert login string to integer
-    MT5_ACCOUNT = int(request.login)
-    MT5_PASSWORD = request.password
-    MT5_SERVER = request.server
     try:
-        connect_mt5()
-        # Create JWT token
+        # Try to connect with provided credentials
+        connect_mt5(request.login, request.password, request.server)
+        
+        # Generate a unique session ID
+        session_id = str(uuid4())
+        
+        # Store user credentials in session
+        user_sessions[session_id] = {
+            "login": request.login,
+            "password": request.password,
+            "server": request.server
+        }
+        
+        # Create JWT token with session ID
         access_token_expires = timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
-        user_data = {"sub": request.login, "server": request.server}
         access_token = create_jwt_token(
-            data=user_data, expires_delta=access_token_expires
+            data={"session_id": session_id}, 
+            expires_delta=access_token_expires
         )
+        
         return {
-            "status": "success", 
+            "status": "success",
             "message": "Logged in successfully",
             "token": access_token,
             "token_type": "bearer",
@@ -372,6 +405,298 @@ def login(request: LoginRequest):
         return {"status": "error", "message": str(e.detail)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/mt5/pnl")
+async def get_pnl(cumulative: bool = Query(False), days: int = Query(30, ge=1, le=365), user: dict = Depends(get_user_session)):
+    """
+    Get daily net P&L or cumulative P&L for the last 'n' days.
+    :param cumulative: If True, return cumulative P&L; otherwise, return daily net P&L.
+    :param days: Number of days to retrieve data for.
+    """
+    connect_mt5(user["login"], user["password"], user["server"])
+
+    # Define the time range
+    from_date = datetime.now() - timedelta(days=days)
+    to_date = datetime.now()
+
+    # Convert datetime to timestamp
+    from_timestamp = int(from_date.timestamp())
+    to_timestamp = int(to_date.timestamp())
+
+    # Get historical deals
+    history_deals = mt5.history_deals_get(from_timestamp, to_timestamp)
+
+    if history_deals is None:
+        raise HTTPException(status_code=500, detail="Failed to retrieve historical deals")
+
+    # Group deals by day and calculate daily P&L
+    daily_pnl = {}
+    for deal in history_deals:
+        deal_time = datetime.fromtimestamp(deal.time).date()  # Get the date of the deal
+        if deal_time not in daily_pnl:
+            daily_pnl[deal_time] = 0
+        daily_pnl[deal_time] += deal.profit  # Sum up the profit for the day
+
+    # Sort by date
+    sorted_pnl = sorted(daily_pnl.items())
+
+    # Prepare the response data
+    response_data = []
+    cumulative_pnl = 0
+    for date, pnl in sorted_pnl:
+        if cumulative:
+            cumulative_pnl += pnl
+            response_data.append({"date": date.isoformat(), "pnl": cumulative_pnl})
+        else:
+            response_data.append({"date": date.isoformat(), "pnl": pnl})
+
+    return response_data
+
+# Competition endpoints
+@app.post("/api/competitions")
+async def create_competition(competition: Competition):
+    """Create a new competition"""
+    competition_id = str(uuid4())
+    competitions[competition_id] = {
+        **competition.dict(),
+        "id": competition_id, 
+        "created_at": datetime.utcnow(),
+        "participants_count": 0
+    }
+    
+    # Initialize empty participants list
+    competition_participants[competition_id] = []
+    
+    return {
+        "status": "success", 
+        "message": "Competition created successfully",
+        "id": competition_id
+    }
+
+@app.get("/api/competitions")
+async def list_competitions(status: str = None):
+    """List all competitions or filter by status"""
+    filtered_competitions = []
+    
+    for comp_id, comp in competitions.items():
+        # Update competition status based on dates
+        now = datetime.utcnow()
+        comp_start = comp["start_date"]
+        comp_end = comp["end_date"]
+        
+        # Auto-update status based on dates
+        if now < comp_start:
+            comp["status"] = "upcoming"
+        elif now >= comp_start and now <= comp_end:
+            comp["status"] = "active"
+        elif now > comp_end:
+            comp["status"] = "completed"
+        
+        # Apply status filter if provided
+        if status is None or comp["status"] == status:
+            filtered_competitions.append({
+                **comp,
+                "participants_count": len(competition_participants.get(comp_id, [])),
+                "start_date": comp["start_date"].isoformat(),
+                "end_date": comp["end_date"].isoformat()
+            })
+    
+    return {"competitions": filtered_competitions}
+
+@app.get("/api/competitions/{competition_id}")
+async def get_competition(competition_id: str):
+    """Get competition details by ID"""
+    if competition_id not in competitions:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    
+    competition = competitions[competition_id]
+    participants_list = competition_participants.get(competition_id, [])
+    
+    return {
+        **competition,
+        "participants_count": len(participants_list),
+        "start_date": competition["start_date"].isoformat(),
+        "end_date": competition["end_date"].isoformat()
+    }
+
+@app.post("/api/competitions/{competition_id}/register")
+async def register_for_competition(competition_id: str, registration: CompetitionRegistration):
+    """Register a user for a competition"""
+    if competition_id not in competitions:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    
+    competition = competitions[competition_id]
+    
+    # Check if competition is open for registration (upcoming or active)
+    if competition["status"] == "completed":
+        raise HTTPException(status_code=400, detail="This competition has ended and is no longer accepting registrations")
+    
+    # Check if user is already registered
+    if any(p["user_id"] == registration.user_id for p in competition_participants.get(competition_id, [])):
+        raise HTTPException(status_code=400, detail="User is already registered for this competition")
+    
+    # Add participant to competition
+    competition_participants.setdefault(competition_id, []).append({
+        "user_id": registration.user_id,
+        "user_name": registration.name,
+        "email": registration.email,
+        "experience": registration.experience,
+        "comments": registration.comments,
+        "mt5_account_id": None,  # Will be assigned by admin
+        "mt5_password": None,
+        "mt5_server": None,
+        "registration_date": datetime.utcnow(),
+        "status": "pending"  # pending, approved, rejected
+    })
+    
+    competitions[competition_id]["participants_count"] = len(competition_participants[competition_id])
+    
+    return {
+        "status": "success",
+        "message": "Registration successful. Admin will review and provide MT5 credentials."
+    }
+
+@app.post("/api/competitions/{competition_id}/assign-account")
+async def assign_account(
+    competition_id: str, 
+    user_id: str, 
+    mt5_account: str, 
+    mt5_password: str, 
+    mt5_server: str
+):
+    """Admin endpoint to assign MT5 credentials to a participant"""
+    if competition_id not in competitions:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    
+    participants = competition_participants.get(competition_id, [])
+    participant_found = False
+    
+    for i, participant in enumerate(participants):
+        if participant["user_id"] == user_id:
+            participant_found = True
+            participants[i].update({
+                "mt5_account_id": mt5_account,
+                "mt5_password": mt5_password,
+                "mt5_server": mt5_server,
+                "status": "approved",
+                "approved_at": datetime.utcnow()
+            })
+            break
+    
+    if not participant_found:
+        raise HTTPException(status_code=404, detail="Participant not found")
+    
+    return {
+        "status": "success",
+        "message": "MT5 account credentials assigned successfully"
+    }
+
+@app.post("/api/competitions/{competition_id}/calculate-results")
+async def calculate_competition_results(competition_id: str):
+    """Calculate and store results for a competition"""
+    if competition_id not in competitions:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    
+    competition = competitions[competition_id]
+    
+    # Check if competition has ended
+    now = datetime.utcnow()
+    if now <= competition["end_date"]:
+        raise HTTPException(status_code=400, detail="Competition is still active. Cannot calculate results yet.")
+    
+    participants = competition_participants.get(competition_id, [])
+    if not participants:
+        raise HTTPException(status_code=400, detail="No participants in this competition")
+    
+    # Filter out participants without MT5 accounts
+    participants_with_accounts = [p for p in participants if p.get("mt5_account_id")]
+    
+    if not participants_with_accounts:
+        raise HTTPException(status_code=400, detail="No participants with MT5 accounts found")
+    
+    # Calculate results for each participant
+    results = []
+    for participant in participants_with_accounts:
+        try:
+            # Connect to MT5 with participant's credentials
+            connect_mt5(
+                participant["mt5_account_id"],
+                participant["mt5_password"],
+                participant["mt5_server"]
+            )
+            
+            # Get account info
+            account_info = mt5.account_info()
+            if not account_info:
+                print(f"Failed to get account info for participant {participant['user_id']}")
+                continue
+            
+            # Calculate profit based on initial balance (default 10000)
+            initial_balance = participant.get("initial_balance", 10000.0)
+            final_balance = account_info.balance
+            profit = final_balance - initial_balance
+            profit_percentage = (profit / initial_balance) * 100
+            
+            results.append({
+                "user_id": participant["user_id"],
+                "user_name": participant["user_name"],
+                "mt5_account_id": participant["mt5_account_id"],
+                "initial_balance": initial_balance,
+                "final_balance": final_balance,
+                "profit": profit,
+                "profit_percentage": profit_percentage,
+                "calculated_at": datetime.utcnow()
+            })
+            
+        except Exception as e:
+            print(f"Error calculating results for participant {participant['user_id']}: {str(e)}")
+    
+    # Sort results by profit (descending)
+    results.sort(key=lambda x: x["profit"], reverse=True)
+    
+    # Store results
+    competition_results[competition_id] = results
+    
+    # Update competition status
+    competitions[competition_id]["status"] = "completed"
+    competitions[competition_id]["results_calculated"] = True
+    
+    return {
+        "status": "success",
+        "message": "Competition results calculated successfully",
+        "results": results[:10]  # Return top 10 results
+    }
+
+@app.get("/api/competitions/{competition_id}/leaderboard")
+async def get_competition_leaderboard(competition_id: str):
+    """Get competition leaderboard"""
+    if competition_id not in competitions:
+        raise HTTPException(status_code=404, detail="Competition not found")
+    
+    competition = competitions[competition_id]
+    
+    # Check if results have been calculated
+    if competition["status"] != "completed" or competition_id not in competition_results:
+        raise HTTPException(status_code=400, detail="Results not yet calculated for this competition")
+    
+    # Get top results
+    results = competition_results[competition_id]
+    
+    # Add rank information
+    for i, result in enumerate(results):
+        result["rank"] = i + 1
+    
+    return {
+        "competition": {
+            "id": competition_id,
+            "name": competition["name"],
+            "description": competition["description"],
+            "start_date": competition["start_date"].isoformat(),
+            "end_date": competition["end_date"].isoformat(),
+        },
+        "results": results,
+        "top_winners": results[:3] if len(results) >= 3 else results
+    }
 
 @app.on_event("startup")
 async def startup_event():
@@ -387,51 +712,5 @@ async def shutdown_event():
     mt5.shutdown()
     print("MT5 connection closed.")
 
-
-@app.get("/api/mt5/pnl")
-def get_pnl(cumulative: bool = Query(False), days: int = Query(30, ge=1, le=365)):
-    """
-    Get daily net P&L or cumulative P&L for the last 'n' days.
-    :param cumulative: If True, return cumulative P&L; otherwise, return daily net P&L.
-    :param days: Number of days to retrieve data for.
-    """
-    connect_mt5()
-    
-    # Define the time range
-    from_date = datetime.now() - timedelta(days=days)
-    to_date = datetime.now()
-    
-    # Convert datetime to timestamp
-    from_timestamp = int(from_date.timestamp())
-    to_timestamp = int(to_date.timestamp())
-    
-    # Get historical deals
-    history_deals = mt5.history_deals_get(from_timestamp, to_timestamp)
-    
-    if history_deals is None:
-        raise HTTPException(status_code=500, detail="Failed to retrieve historical deals")
-    
-    # Group deals by day and calculate daily P&L
-    daily_pnl = {}
-    for deal in history_deals:
-        deal_time = datetime.fromtimestamp(deal.time).date()  # Get the date of the deal
-        if deal_time not in daily_pnl:
-            daily_pnl[deal_time] = 0
-        daily_pnl[deal_time] += deal.profit  # Sum up the profit for the day
-    
-    # Sort by date
-    sorted_pnl = sorted(daily_pnl.items())
-    
-    # Prepare the response data
-    response_data = []
-    cumulative_pnl = 0
-    for date, pnl in sorted_pnl:
-        if cumulative:
-            cumulative_pnl += pnl
-            response_data.append({"date": date.isoformat(), "pnl": cumulative_pnl})
-        else:
-            response_data.append({"date": date.isoformat(), "pnl": pnl})
-    
-    return response_data
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
